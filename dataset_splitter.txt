@@ -1,0 +1,204 @@
+import os
+import shutil
+import random
+import argparse
+from typing import List, Tuple, Dict
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
+
+
+def get_valid_files(image_dir: str, label_dir: str,
+                    image_extensions: List[str] = ['.jpg', '.jpeg', '.png', '.bmp']) -> Tuple[
+    List[str], Dict[str, str]]:
+    """
+    Get list of valid files with matching images and labels, plus extension mapping
+
+    Parameters:
+        image_dir: Directory containing image files
+        label_dir: Directory containing label files (.txt)
+        image_extensions: List of supported image extensions
+
+    Returns:
+        Tuple containing:
+            - List of valid base filenames
+            - Dictionary mapping base filenames to their extensions
+    """
+    # Build image file mapping (base name -> extension)
+    image_files = {}
+    for fname in os.listdir(image_dir):
+        lower_fname = fname.lower()
+        if any(lower_fname.endswith(ext) for ext in image_extensions):
+            base = os.path.splitext(fname)[0]
+            image_files[base] = os.path.splitext(fname)[1]
+
+    # Extract label file base names
+    label_files = {os.path.splitext(f)[0] for f in os.listdir(label_dir)
+                   if f.lower().endswith('.txt')}
+
+    # Filter for matching files
+    valid_bases = [base for base in image_files if base in label_files]
+    valid_extensions = {base: image_files[base] for base in valid_bases}
+
+    if len(image_files) > len(valid_bases):
+        print(f"Warning: Skipped {len(image_files) - len(valid_bases)} files without matching labels")
+    return valid_bases, valid_extensions
+
+
+def split_dataset(valid_files: List[str],
+                  ratio: Tuple[float, float, float] = (0.7, 0.2, 0.1),
+                  seed: int = None) -> Tuple[List[str], List[str], List[str]]:
+    """
+    Randomly split files into training, validation, and test sets by ratio
+
+    Parameters:
+        valid_files: List of valid base filenames
+        ratio: Split ratio (train, val, test)
+        seed: Random seed for reproducibility
+
+    Returns:
+        Lists of filenames for training, validation, and test sets
+    """
+    total = len(valid_files)
+    if total == 0:
+        return [], [], []
+
+    # Set seed for reproducibility if specified
+    if seed is not None:
+        random.seed(seed)
+
+    # Calculate set sizes
+    train_size = round(ratio[0] * total)
+    val_size = round(ratio[1] * total)
+    test_size = total - train_size - val_size  # Ensure total consistency
+
+    # Shuffle and split
+    shuffled = random.sample(valid_files, total)
+    return (
+        shuffled[:train_size],
+        shuffled[train_size:train_size + val_size],
+        shuffled[train_size + val_size:]
+    )
+
+
+def _copy_single_file(base_name: str, src_img_dir: str, src_label_dir: str,
+                      dest_img_dir: str, dest_label_dir: str,
+                      ext_map: Dict[str, str], label_ext: str) -> bool:
+    """Internal helper: Copy a single file pair (image + label)"""
+    try:
+        # Copy image
+        ext = ext_map[base_name]
+        shutil.copy2(
+            os.path.join(src_img_dir, f"{base_name}{ext}"),
+            os.path.join(dest_img_dir, f"{base_name}{ext}")
+        )
+
+        # Copy label
+        shutil.copy2(
+            os.path.join(src_label_dir, f"{base_name}{label_ext}"),
+            os.path.join(dest_label_dir, f"{base_name}{label_ext}")
+        )
+        return True
+    except Exception as e:
+        print(f"Failed to copy {base_name}: {str(e)}")
+        return False
+
+
+def copy_files(file_list: List[str], src_img_dir: str, src_label_dir: str,
+               dest_root: str, subset: str, ext_map: Dict[str, str],
+               label_ext: str, max_workers: int = 8) -> None:
+    """
+    Batch copy files to target directory (multi-threaded for speed)
+
+    Parameters:
+        file_list: List of base filenames to copy
+        src_img_dir: Source directory for images
+        src_label_dir: Source directory for labels
+        dest_root: Root directory for destination
+        subset: Subset name (train/val/test)
+        ext_map: Mapping from base names to image extensions
+        label_ext: Extension for label files (e.g., .txt)
+        max_workers: Number of threads for parallel copying
+    """
+    # Create destination directories
+    dest_img = os.path.join(dest_root, subset, "images")
+    dest_label = os.path.join(dest_root, subset, "labels")
+    os.makedirs(dest_img, exist_ok=True)
+    os.makedirs(dest_label, exist_ok=True)
+
+    # Copy files with multi-threading
+    print(f"Starting copy for {subset} dataset...")
+    success_count = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                _copy_single_file,
+                base, src_img_dir, src_label_dir,
+                dest_img, dest_label, ext_map, label_ext
+            ) for base in file_list
+        ]
+
+        for future in tqdm(futures, desc=f"Processing {subset}"):
+            if future.result():
+                success_count += 1
+
+    print(f"{subset} dataset copy complete: {success_count}/{len(file_list)} successful")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Split dataset into train/val/test sets')
+    parser.add_argument('--src-image-dir', required=True, help='Source directory containing images')
+    parser.add_argument('--src-label-dir', required=True, help='Source directory containing label files')
+    parser.add_argument('--dest-root', required=True, help='Root directory for split dataset')
+    parser.add_argument('--train-ratio', type=float, default=0.7, help='Training set ratio (default: 0.7)')
+    parser.add_argument('--val-ratio', type=float, default=0.2, help='Validation set ratio (default: 0.2)')
+    parser.add_argument('--test-ratio', type=float, default=0.1, help='Test set ratio (default: 0.1)')
+    parser.add_argument('--label-ext', default='.txt', help='Extension for label files (default: .txt)')
+    parser.add_argument('--max-workers', type=int, default=8, help='Number of worker threads for copying')
+    parser.add_argument('--seed', type=int, help='Random seed for reproducible splits')
+
+    args = parser.parse_args()
+
+    # Validate ratios
+    total_ratio = args.train_ratio + args.val_ratio + args.test_ratio
+    if not (0.99 <= total_ratio <= 1.01):
+        raise ValueError(f"Sum of ratios must be approximately 1, got {total_ratio}")
+
+    # Verify dependencies
+    try:
+        import tqdm
+    except ImportError:
+        print("Please install required dependency: pip install tqdm")
+        return
+
+    # Execute workflow
+    valid_files, ext_map = get_valid_files(args.src_image_dir, args.src_label_dir)
+    print(f"Found {len(valid_files)} valid file pairs")
+
+    train, val, test = split_dataset(
+        valid_files,
+        (args.train_ratio, args.val_ratio, args.test_ratio),
+        args.seed
+    )
+
+    print(f"Split results: {len(train)} training, {len(val)} validation, {len(test)} test")
+
+    # Copy files in sequence
+    copy_files(
+        test, args.src_image_dir, args.src_label_dir,
+        args.dest_root, "test", ext_map, args.label_ext, args.max_workers
+    )
+    copy_files(
+        val, args.src_image_dir, args.src_label_dir,
+        args.dest_root, "val", ext_map, args.label_ext, args.max_workers
+    )
+    copy_files(
+        train, args.src_image_dir, args.src_label_dir,
+        args.dest_root, "train", ext_map, args.label_ext, args.max_workers
+    )
+
+    print("Dataset splitting completed successfully!")
+
+
+if __name__ == "__main__":
+    main()
